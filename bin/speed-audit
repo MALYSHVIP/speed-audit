@@ -1,0 +1,605 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="Speed Audit"
+APP_VERSION="1.2.0"
+
+MENU_KEYS=()
+MENU_TITLES=()
+MENU_DESCRIPTIONS=()
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+float_ge() {
+  awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'
+}
+
+float_le() {
+  awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'
+}
+
+format_mb() {
+  awk -v mb="$1" 'BEGIN {
+    if (mb >= 1024) {
+      printf "%.1f ГБ", mb / 1024
+    } else {
+      printf "%d МБ", mb
+    }
+  }'
+}
+
+format_percent() {
+  awk -v value="$1" 'BEGIN { printf "%.1f%%", value }'
+}
+
+trim() {
+  awk '{$1=$1; print}'
+}
+
+dir_size_mb() {
+  local path="$1"
+  du -sm "$path" 2>/dev/null | awk '{print $1 + 0}'
+}
+
+print_line() {
+  printf '%s\n' "============================================================"
+}
+
+print_block_title() {
+  printf '\n%s\n' "$1"
+}
+
+pause_before_menu_return() {
+  if [[ -t 0 && -t 1 ]]; then
+    printf '\nНажмите Enter, чтобы вернуться в меню...'
+    read -r _ || true
+  fi
+}
+
+cpu_usage_percent() {
+  local user nice system idle iowait irq softirq steal guest guest_nice
+  local prev_idle prev_total idle_now total_now idle_delta total_delta
+
+  read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+  prev_idle=$((idle + iowait))
+  prev_total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+  sleep 1
+  read -r _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+  idle_now=$((idle + iowait))
+  total_now=$((user + nice + system + idle + iowait + irq + softirq + steal))
+
+  idle_delta=$((idle_now - prev_idle))
+  total_delta=$((total_now - prev_total))
+
+  awk -v idle_delta="$idle_delta" -v total_delta="$total_delta" 'BEGIN {
+    if (total_delta <= 0) {
+      printf "0.0"
+    } else {
+      printf "%.1f", (100 * (total_delta - idle_delta) / total_delta)
+    }
+  }'
+}
+
+collect_speedtest_json() {
+  local output_file="$1"
+
+  if ! command_exists speedtest; then
+    return 1
+  fi
+
+  speedtest --accept-license --accept-gdpr --format=json >"${output_file}"
+}
+
+require_root_for_action() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    printf 'Для этого действия нужен root. Запустите команду через sudo.\n'
+    return 1
+  fi
+
+  return 0
+}
+
+count_old_temp_files() {
+  find /tmp /var/tmp -mindepth 1 -type f -mtime +3 2>/dev/null | wc -l | awk '{print $1}'
+}
+
+count_old_empty_temp_dirs() {
+  find /tmp /var/tmp -mindepth 1 -type d -empty -mtime +3 2>/dev/null | wc -l | awk '{print $1}'
+}
+
+clean_apt_cache_impl() {
+  require_root_for_action || return 1
+  apt-get clean
+  printf 'Кеш apt очищен. Текущий размер: %s\n' "$(format_mb "$(dir_size_mb /var/cache/apt)")"
+}
+
+vacuum_logs_impl() {
+  require_root_for_action || return 1
+
+  if command_exists journalctl; then
+    journalctl --vacuum-time=7d
+  else
+    printf 'Команда journalctl недоступна, журналы systemd пропущены.\n'
+  fi
+
+  printf 'Текущий размер /var/log: %s\n' "$(format_mb "$(dir_size_mb /var/log)")"
+}
+
+cleanup_temp_impl() {
+  local before_files before_dirs after_files after_dirs removed_files removed_dirs
+
+  require_root_for_action || return 1
+
+  before_files="$(count_old_temp_files)"
+  before_dirs="$(count_old_empty_temp_dirs)"
+
+  find /tmp /var/tmp -mindepth 1 -type f -mtime +3 -delete 2>/dev/null || true
+  find /tmp /var/tmp -mindepth 1 -type d -empty -mtime +3 -delete 2>/dev/null || true
+
+  after_files="$(count_old_temp_files)"
+  after_dirs="$(count_old_empty_temp_dirs)"
+
+  removed_files=$((before_files - after_files))
+  removed_dirs=$((before_dirs - after_dirs))
+
+  printf 'Удалено старых временных файлов: %d\n' "${removed_files}"
+  printf 'Удалено пустых временных каталогов: %d\n' "${removed_dirs}"
+  printf 'Текущий размер /tmp: %s, /var/tmp: %s\n' \
+    "$(format_mb "$(dir_size_mb /tmp)")" \
+    "$(format_mb "$(dir_size_mb /var/tmp)")"
+}
+
+run_safe_cleanup_impl() {
+  clean_apt_cache_impl || return 1
+  vacuum_logs_impl || return 1
+  cleanup_temp_impl || return 1
+}
+
+show_largest_directories_impl() {
+  printf 'Самые тяжелые каталоги в корне:\n'
+  du -xhd1 / 2>/dev/null | sort -hr | head -n 12
+  printf '\nСамые тяжелые каталоги в /var:\n'
+  du -xhd1 /var 2>/dev/null | sort -hr | head -n 12
+}
+
+show_top_cpu_processes_impl() {
+  printf 'Самые нагруженные процессы по CPU:\n'
+  ps -eo pid,user,comm,%cpu,%mem --sort=-%cpu | head -n 12
+}
+
+show_top_mem_processes_impl() {
+  printf 'Самые прожорливые процессы по RAM:\n'
+  ps -eo pid,user,comm,%mem,%cpu --sort=-%mem | head -n 12
+}
+
+rerun_speedtest_impl() {
+  local speedtest_json speed_ping speed_jitter speed_packet_loss speed_download speed_upload speed_server speed_isp
+
+  if ! command_exists speedtest; then
+    printf 'Speedtest не найден. Сначала выполните установку через install.sh.\n'
+    return 1
+  fi
+
+  if ! command_exists jq; then
+    printf 'jq не найден. Установщик должен доставить этот пакет.\n'
+    return 1
+  fi
+
+  speedtest_json="$(mktemp)"
+
+  if collect_speedtest_json "${speedtest_json}"; then
+    speed_ping="$(jq -r '.ping.latency // 0' "${speedtest_json}")"
+    speed_jitter="$(jq -r '.ping.jitter // 0' "${speedtest_json}")"
+    speed_packet_loss="$(jq -r '.packetLoss // 0' "${speedtest_json}")"
+    speed_download="$(jq -r 'if .download.bandwidth then (.download.bandwidth * 8 / 1000000) else 0 end' "${speedtest_json}")"
+    speed_upload="$(jq -r 'if .upload.bandwidth then (.upload.bandwidth * 8 / 1000000) else 0 end' "${speedtest_json}")"
+    speed_server="$(jq -r '.server.name // "неизвестно"' "${speedtest_json}")"
+    speed_isp="$(jq -r '.isp // "неизвестно"' "${speedtest_json}")"
+
+    printf 'Повторный сетевой тест завершен.\n'
+    printf 'Провайдер: %s\n' "${speed_isp}"
+    printf 'Сервер: %s\n' "${speed_server}"
+    printf 'Пинг: %.1f мс\n' "${speed_ping}"
+    printf 'Jitter: %.1f мс\n' "${speed_jitter}"
+    printf 'Потери пакетов: %.1f%%\n' "${speed_packet_loss}"
+    printf 'Скорость загрузки: %.1f Мбит/с\n' "${speed_download}"
+    printf 'Скорость отдачи: %.1f Мбит/с\n' "${speed_upload}"
+  else
+    printf 'Повторный сетевой тест не завершился. Проверьте исходящий доступ в интернет.\n'
+    rm -f "${speedtest_json}"
+    return 1
+  fi
+
+  rm -f "${speedtest_json}"
+}
+
+repeat_full_audit_impl() {
+  SPEED_AUDIT_SKIP_MENU=1 "$0"
+}
+
+add_menu_action() {
+  MENU_KEYS+=("$1")
+  MENU_TITLES+=("$2")
+  MENU_DESCRIPTIONS+=("$3")
+}
+
+build_action_menu() {
+  local cpu_usage="$1"
+  local load_per_core="$2"
+  local mem_used_pct="$3"
+  local disk_used_pct="$4"
+  local junk_total_mb="$5"
+
+  MENU_KEYS=()
+  MENU_TITLES=()
+  MENU_DESCRIPTIONS=()
+
+  if (( junk_total_mb >= 256 )) || float_ge "${disk_used_pct}" "70"; then
+    add_menu_action "safe_cleanup" "Быстрая безопасная очистка" "Чистит кеш apt, старые журналы и старые временные файлы."
+    add_menu_action "clean_apt_cache" "Почистить кеш apt" "Освобождает место, занятое скачанными пакетами."
+    add_menu_action "vacuum_logs" "Почистить старые журналы" "Оставляет недавние журналы systemd и уменьшает /var/log."
+    add_menu_action "cleanup_temp" "Почистить временные файлы" "Удаляет старые файлы из /tmp и /var/tmp."
+    add_menu_action "show_large_dirs" "Показать тяжелые каталоги" "Помогает найти, где именно съедается место."
+  else
+    add_menu_action "show_large_dirs" "Показать тяжелые каталоги" "Полезно для ручной оценки диска и мусора."
+  fi
+
+  if float_ge "${cpu_usage}" "60" || float_ge "${load_per_core}" "1.0"; then
+    add_menu_action "show_top_cpu" "Показать процессы по CPU" "Показывает, кто сильнее всего грузит процессор."
+  fi
+
+  if float_ge "${mem_used_pct}" "70"; then
+    add_menu_action "show_top_mem" "Показать процессы по RAM" "Показывает процессы, которые сильнее всего занимают память."
+  fi
+
+  if command_exists speedtest; then
+    add_menu_action "rerun_speedtest" "Повторить Speedtest" "Запускает повторную сетевую проверку прямо сейчас."
+  fi
+
+  add_menu_action "repeat_full_audit" "Повторить полную проверку" "Снова пересчитывает отчет после ваших действий."
+}
+
+run_menu_action() {
+  local action_key="$1"
+
+  case "${action_key}" in
+    safe_cleanup)
+      run_safe_cleanup_impl
+      ;;
+    clean_apt_cache)
+      clean_apt_cache_impl
+      ;;
+    vacuum_logs)
+      vacuum_logs_impl
+      ;;
+    cleanup_temp)
+      cleanup_temp_impl
+      ;;
+    show_large_dirs)
+      show_largest_directories_impl
+      ;;
+    show_top_cpu)
+      show_top_cpu_processes_impl
+      ;;
+    show_top_mem)
+      show_top_mem_processes_impl
+      ;;
+    rerun_speedtest)
+      rerun_speedtest_impl
+      ;;
+    repeat_full_audit)
+      repeat_full_audit_impl
+      ;;
+    *)
+      printf 'Неизвестное действие: %s\n' "${action_key}"
+      return 1
+      ;;
+  esac
+}
+
+show_action_menu() {
+  local cpu_usage="$1"
+  local load_per_core="$2"
+  local mem_used_pct="$3"
+  local disk_used_pct="$4"
+  local junk_total_mb="$5"
+  local choice action_key menu_index
+
+  if [[ "${SPEED_AUDIT_SKIP_MENU:-0}" == "1" ]] || [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
+    return 0
+  fi
+
+  build_action_menu "${cpu_usage}" "${load_per_core}" "${mem_used_pct}" "${disk_used_pct}" "${junk_total_mb}"
+
+  if ((${#MENU_KEYS[@]} == 0)); then
+    return 0
+  fi
+
+  while true; do
+    print_block_title "Что можно сделать прямо сейчас"
+    printf 'Выберите действие по номеру и нажмите Enter.\n'
+    printf '0. Завершить\n'
+
+    for menu_index in "${!MENU_KEYS[@]}"; do
+      printf '%d. %s\n' "$((menu_index + 1))" "${MENU_TITLES[menu_index]}"
+      printf '   %s\n' "${MENU_DESCRIPTIONS[menu_index]}"
+    done
+
+    printf '\nВведите номер действия: '
+    read -r choice || break
+
+    if [[ "${choice}" == "0" ]]; then
+      break
+    fi
+
+    if ! [[ "${choice}" =~ ^[0-9]+$ ]]; then
+      printf 'Нужно ввести только номер действия.\n'
+      pause_before_menu_return
+      continue
+    fi
+
+    menu_index=$((choice - 1))
+    if (( menu_index < 0 || menu_index >= ${#MENU_KEYS[@]} )); then
+      printf 'Такого номера в меню нет.\n'
+      pause_before_menu_return
+      continue
+    fi
+
+    action_key="${MENU_KEYS[menu_index]}"
+    printf '\n'
+    run_menu_action "${action_key}" || true
+    pause_before_menu_return
+  done
+}
+
+main() {
+  local hostname_now timestamp os_name kernel_name uptime_human cpu_model cpu_cores
+  local load1 load5 load15 load_avg load_per_core
+  local cpu_usage cpu_status cpu_advice
+  local mem_total_mb mem_used_mb mem_available_mb mem_used_pct mem_status mem_advice
+  local disk_total_mb disk_used_mb disk_free_mb disk_used_pct disk_status disk_advice
+  local apt_cache_mb tmp_mb vartmp_mb varlog_mb junk_total_mb junk_status junk_advice
+  local overall_points=0
+  local recommendations=()
+  local speedtest_json=""
+  local speedtest_ok=0
+  local speed_ping="" speed_jitter="" speed_packet_loss="" speed_download="" speed_upload="" speed_server="" speed_isp=""
+  local net_status="Сетевой тест не запускался."
+  local net_advice="Для оценки канала установите Ookla Speedtest."
+
+  hostname_now="$(hostname 2>/dev/null || echo "неизвестно")"
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  os_name="$(. /etc/os-release 2>/dev/null && printf '%s %s' "${NAME:-Linux}" "${VERSION_ID:-}")"
+  kernel_name="$(uname -r 2>/dev/null || echo "неизвестно")"
+  uptime_human="$(uptime -p 2>/dev/null | sed 's/^up //')"
+  cpu_model="$(awk -F': ' '/model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null | trim)"
+  cpu_model="${cpu_model:-неизвестно}"
+  cpu_cores="$(nproc 2>/dev/null || echo "1")"
+  read -r load1 load5 load15 _ < /proc/loadavg
+  load_avg="$(printf '%s / %s / %s' "${load1}" "${load5}" "${load15}")"
+  load_per_core="$(awk -v load1="${load1}" -v cores="${cpu_cores}" 'BEGIN {
+    if (cores <= 0) {
+      printf "0.00"
+    } else {
+      printf "%.2f", load1 / cores
+    }
+  }')"
+  cpu_usage="$(cpu_usage_percent)"
+
+  mem_total_mb="$(free -m | awk '/^Mem:/ {print $2}')"
+  mem_used_mb="$(free -m | awk '/^Mem:/ {print $3}')"
+  mem_available_mb="$(free -m | awk '/^Mem:/ {print $7}')"
+  mem_used_pct="$(awk -v used="${mem_used_mb}" -v total="${mem_total_mb}" 'BEGIN {
+    if (total <= 0) {
+      printf "0.0"
+    } else {
+      printf "%.1f", (used * 100 / total)
+    }
+  }')"
+
+  read -r disk_total_mb disk_used_mb disk_free_mb disk_used_pct < <(
+    df -Pm / | awk 'NR == 2 {
+      gsub(/%/, "", $5)
+      print $2, $3, $4, $5
+    }'
+  )
+
+  apt_cache_mb="$(dir_size_mb /var/cache/apt)"
+  tmp_mb="$(dir_size_mb /tmp)"
+  vartmp_mb="$(dir_size_mb /var/tmp)"
+  varlog_mb="$(dir_size_mb /var/log)"
+  junk_total_mb=$((apt_cache_mb + tmp_mb + vartmp_mb + varlog_mb))
+
+  if float_ge "${cpu_usage}" "85" || float_ge "${load_per_core}" "1.50"; then
+    cpu_status="Нагрузка на процессор уже высокая. Есть риск очереди задач и просадки по скорости."
+    cpu_advice="Рекомендация: посмотреть самые тяжелые процессы и подумать о расширении по CPU."
+    overall_points=$((overall_points + 2))
+    recommendations+=("Проверить процессы, нагружающие CPU, и оценить необходимость расширения по ядрам.")
+  elif float_ge "${cpu_usage}" "60" || float_ge "${load_per_core}" "1.00"; then
+    cpu_status="Процессор в рабочей зоне, но нагрузка уже повышенная."
+    cpu_advice="Рекомендация: понаблюдать за процессами и пиковыми часами работы."
+    overall_points=$((overall_points + 1))
+    recommendations+=("Следить за пиковыми периодами нагрузки на CPU и load average.")
+  else
+    cpu_status="Все в порядке, процессор не перегружен."
+    cpu_advice="Рекомендация: текущего запаса процессора достаточно."
+  fi
+
+  if float_ge "${mem_used_pct}" "85"; then
+    mem_status="Оперативная память занята сильно. Сервер близок к нехватке RAM."
+    mem_advice="Рекомендация: увеличить объем памяти или разгрузить сервисы."
+    overall_points=$((overall_points + 2))
+    recommendations+=("Увеличить объем RAM или отключить лишние процессы.")
+  elif float_ge "${mem_used_pct}" "70"; then
+    mem_status="Память занята заметно, но запас еще есть."
+    mem_advice="Рекомендация: следить, чтобы потребление RAM не росло дальше."
+    overall_points=$((overall_points + 1))
+    recommendations+=("Понаблюдать за ростом потребления оперативной памяти.")
+  else
+    mem_status="Память в норме, свободный запас есть."
+    mem_advice="Рекомендация: по оперативной памяти расширение пока не требуется."
+  fi
+
+  if float_ge "${disk_used_pct}" "90"; then
+    disk_status="Диск заполнен очень сильно. Это уже опасная зона."
+    disk_advice="Рекомендация: срочно освобождать место или расширять диск."
+    overall_points=$((overall_points + 2))
+    recommendations+=("Освободить место на диске или увеличить объем хранилища.")
+  elif float_ge "${disk_used_pct}" "75"; then
+    disk_status="Диск заполнен заметно. Пока работать можно, но запас уменьшается."
+    disk_advice="Рекомендация: почистить старые файлы и подготовить план расширения."
+    overall_points=$((overall_points + 1))
+    recommendations+=("Почистить диск и держать под контролем рост данных.")
+  else
+    disk_status="По диску все в порядке, свободное место есть."
+    disk_advice="Рекомендация: срочное расширение диска не требуется."
+  fi
+
+  if (( junk_total_mb >= 3072 )); then
+    junk_status="Служебного мусора уже много: кеши, временные файлы и журналы занимают заметный объем."
+    junk_advice="Рекомендация: выполнить чистку /tmp, /var/tmp, /var/log и кеша apt."
+    overall_points=$((overall_points + 2))
+    recommendations+=("Почистить временные файлы, журналы и кеш apt.")
+  elif (( junk_total_mb >= 1024 )); then
+    junk_status="Служебный мусор уже накопился, но ситуация пока не критичная."
+    junk_advice="Рекомендация: планово почистить кеши и старые временные файлы."
+    overall_points=$((overall_points + 1))
+    recommendations+=("Сделать плановую чистку кешей и временных файлов.")
+  else
+    junk_status="Мусора немного, срочная чистка не нужна."
+    junk_advice="Рекомендация: можно оставить как есть и чистить по расписанию."
+  fi
+
+  if command_exists speedtest && command_exists jq; then
+    speedtest_json="$(mktemp)"
+    trap 'rm -f "${speedtest_json:-}"' EXIT
+
+    if collect_speedtest_json "${speedtest_json}"; then
+      speedtest_ok=1
+      speed_ping="$(jq -r '.ping.latency // 0' "${speedtest_json}")"
+      speed_jitter="$(jq -r '.ping.jitter // 0' "${speedtest_json}")"
+      speed_packet_loss="$(jq -r '.packetLoss // 0' "${speedtest_json}")"
+      speed_download="$(jq -r 'if .download.bandwidth then (.download.bandwidth * 8 / 1000000) else 0 end' "${speedtest_json}")"
+      speed_upload="$(jq -r 'if .upload.bandwidth then (.upload.bandwidth * 8 / 1000000) else 0 end' "${speedtest_json}")"
+      speed_server="$(jq -r '.server.name // "неизвестно"' "${speedtest_json}")"
+      speed_isp="$(jq -r '.isp // "неизвестно"' "${speedtest_json}")"
+
+      if float_ge "${speed_packet_loss}" "1.0"; then
+        net_status="Канал работает нестабильно: есть заметные потери пакетов."
+        net_advice="Рекомендация: проверить провайдера, маршрут и сетевую нагрузку."
+        overall_points=$((overall_points + 2))
+        recommendations+=("Проверить потери пакетов и стабильность сетевого канала.")
+      elif float_ge "${speed_ping}" "100"; then
+        net_status="Пинг высокий. Для чувствительных сервисов это уже нехорошо."
+        net_advice="Рекомендация: проверить маршрут, регион сервера или сетевую перегрузку."
+        overall_points=$((overall_points + 2))
+        recommendations+=("Снизить сетевую задержку или перенести нагрузку ближе к пользователям.")
+      elif float_ge "${speed_ping}" "60"; then
+        net_status="Пинг повышенный, но для части задач еще допустимый."
+        net_advice="Рекомендация: наблюдать за задержкой и jitter."
+        overall_points=$((overall_points + 1))
+        recommendations+=("Понаблюдать за пингом и стабильностью канала.")
+      elif float_le "${speed_download}" "30" || float_le "${speed_upload}" "10"; then
+        net_status="Скорость канала низкая. Для нагруженного сервера это может быть узким местом."
+        net_advice="Рекомендация: проверить тариф, порт и ограничения со стороны сети."
+        overall_points=$((overall_points + 1))
+        recommendations+=("Проверить тариф или ограничения по каналу связи.")
+      else
+        net_status="По скорости и задержке сеть выглядит нормально."
+        net_advice="Рекомендация: канал можно использовать в текущем виде."
+      fi
+    else
+      net_status="Speedtest не смог завершить сетевую проверку."
+      net_advice="Рекомендация: повторить тест позже или проверить исходящий доступ в интернет."
+      overall_points=$((overall_points + 1))
+      recommendations+=("Повторить сетевой тест и проверить доступ в интернет.")
+    fi
+  elif command_exists speedtest; then
+    net_status="Speedtest найден, но не установлен jq для разбора результата."
+    net_advice="Рекомендация: установить jq через установщик."
+    overall_points=$((overall_points + 1))
+    recommendations+=("Установить jq для полного сетевого отчета.")
+  else
+    recommendations+=("Установить Ookla Speedtest для проверки ping, download и upload.")
+  fi
+
+  print_line
+  printf '%s %s\n' "${APP_NAME}" "v${APP_VERSION}"
+  print_line
+  printf 'Дата проверки: %s\n' "${timestamp}"
+  printf 'Сервер: %s\n' "${hostname_now}"
+  printf 'Система: %s\n' "${os_name:-Linux}"
+  printf 'Ядро: %s\n' "${kernel_name}"
+  printf 'Время работы: %s\n' "${uptime_human:-неизвестно}"
+
+  print_block_title "Системные ресурсы"
+  printf 'Процессор: %s\n' "${cpu_model}"
+  printf 'Количество ядер: %s\n' "${cpu_cores}"
+  printf 'Текущая загрузка процессора: %s\n' "$(format_percent "${cpu_usage}")"
+  printf 'Load average: %s\n' "${load_avg}"
+  printf 'Load на одно ядро: %s\n' "${load_per_core}"
+  printf 'Оценка: %s\n' "${cpu_status}"
+  printf '%s\n' "${cpu_advice}"
+  printf '\n'
+  printf 'Оперативная память занято: %s из %s (%s)\n' \
+    "$(format_mb "${mem_used_mb}")" \
+    "$(format_mb "${mem_total_mb}")" \
+    "$(format_percent "${mem_used_pct}")"
+  printf 'Оперативная память доступно: %s\n' "$(format_mb "${mem_available_mb}")"
+  printf 'Оценка: %s\n' "${mem_status}"
+  printf '%s\n' "${mem_advice}"
+  printf '\n'
+  printf 'Диск занято: %s из %s (%s)\n' \
+    "$(format_mb "${disk_used_mb}")" \
+    "$(format_mb "${disk_total_mb}")" \
+    "$(format_percent "${disk_used_pct}")"
+  printf 'Диск свободно: %s\n' "$(format_mb "${disk_free_mb}")"
+  printf 'Оценка: %s\n' "${disk_status}"
+  printf '%s\n' "${disk_advice}"
+  printf '\n'
+  printf 'Служебный мусор всего: %s\n' "$(format_mb "${junk_total_mb}")"
+  printf 'Кеш apt: %s, /tmp: %s, /var/tmp: %s, /var/log: %s\n' \
+    "$(format_mb "${apt_cache_mb}")" \
+    "$(format_mb "${tmp_mb}")" \
+    "$(format_mb "${vartmp_mb}")" \
+    "$(format_mb "${varlog_mb}")"
+  printf 'Оценка: %s\n' "${junk_status}"
+  printf '%s\n' "${junk_advice}"
+
+  print_block_title "Сеть и задержка"
+  if (( speedtest_ok == 1 )); then
+    printf 'Провайдер: %s\n' "${speed_isp}"
+    printf 'Тестовый сервер: %s\n' "${speed_server}"
+    printf 'Пинг: %.1f мс\n' "${speed_ping}"
+    printf 'Jitter: %.1f мс\n' "${speed_jitter}"
+    printf 'Потери пакетов: %.1f%%\n' "${speed_packet_loss}"
+    printf 'Скорость загрузки: %.1f Мбит/с\n' "${speed_download}"
+    printf 'Скорость отдачи: %.1f Мбит/с\n' "${speed_upload}"
+  else
+    printf 'Данные Speedtest: недоступны\n'
+  fi
+  printf 'Оценка: %s\n' "${net_status}"
+  printf '%s\n' "${net_advice}"
+
+  print_block_title "Итоговая оценка"
+  if (( overall_points <= 2 )); then
+    printf 'Все в порядке, сервер можно использовать.\n'
+  elif (( overall_points <= 5 )); then
+    printf 'Сервер в рабочем состоянии, но за ресурсами уже стоит наблюдать.\n'
+  else
+    printf 'Серверу желательно уделить внимание: есть признаки перегрузки или нехватки ресурсов.\n'
+  fi
+
+  if ((${#recommendations[@]} > 0)); then
+    printf '\nРекомендации:\n'
+    printf ' - %s\n' "${recommendations[@]}"
+  fi
+
+  print_line
+
+  show_action_menu "${cpu_usage}" "${load_per_core}" "${mem_used_pct}" "${disk_used_pct}" "${junk_total_mb}"
+}
+
+main "$@"
