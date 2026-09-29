@@ -84,12 +84,51 @@ cpu_usage_percent() {
 
 collect_speedtest_json() {
   local output_file="$1"
+  local error_file normalized_file attempt
 
   if ! command_exists speedtest; then
     return 1
   fi
 
-  speedtest --accept-license --accept-gdpr --format=json >"${output_file}"
+  if ! command_exists jq; then
+    return 1
+  fi
+
+  error_file="$(mktemp)"
+  normalized_file="$(mktemp)"
+
+  for attempt in 1 2 3; do
+    : >"${output_file}"
+    : >"${error_file}"
+    : >"${normalized_file}"
+
+    # Ookla may reject or time out on one candidate server and then still
+    # return a valid result. Keep that transient diagnostic out of the audit
+    # output and accept only a real result object.
+    if speedtest --accept-license --accept-gdpr --format=json \
+      >"${output_file}" 2>"${error_file}"; then
+      :
+    fi
+
+    if jq -s 'map(select(.type? == "result")) | last // empty' \
+      "${output_file}" >"${normalized_file}" \
+      && jq -e '.type == "result" and .ping.latency != null' \
+        "${normalized_file}" >/dev/null 2>&1; then
+      cp "${normalized_file}" "${output_file}"
+      rm -f "${error_file}" "${normalized_file}"
+      return 0
+    fi
+
+    if (( attempt < 3 )); then
+      sleep $((attempt * 2))
+    fi
+  done
+
+  if [[ -s "${error_file}" ]]; then
+    tail -n 20 "${error_file}" >&2
+  fi
+  rm -f "${error_file}" "${normalized_file}"
+  return 1
 }
 
 require_root_for_action() {
